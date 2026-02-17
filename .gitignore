@@ -1,0 +1,22 @@
+# editors
+*.swp
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+
+# secrets
+config.yaml
+.env
+*.key
+*.pem
+
+# baby toys
+.DS_Store
+.idea/
+.vscode/

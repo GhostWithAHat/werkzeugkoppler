@@ -1,0 +1,178 @@
+# -----------------------------------------------------------------------------
+# werkzeugkoppler - example configuration
+# -----------------------------------------------------------------------------
+# This file is intentionally verbose and documents all major options inline.
+# It contains NO private data and can be used as a template.
+#
+# Start example:
+#   python -m werkzeugkoppler --config config.yaml.example
+# -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# Service endpoint (the API exposed by werkzeugkoppler itself)
+# -----------------------------------------------------------------------------
+# Base URL used to derive bind host+port for uvicorn.
+# Must include scheme + host + port.
+service_base_url: "http://127.0.0.1:10001"
+
+# Optional API key for incoming client requests.
+# If set, clients must send:
+#   Authorization: Bearer <service_api_key>
+# If omitted, no auth is required at the gateway endpoint.
+service_api_key: "change-me-or-remove"
+
+# -----------------------------------------------------------------------------
+# Upstream LLM (OpenAI-compatible endpoint)
+# -----------------------------------------------------------------------------
+upstream_base_url: "http://127.0.0.1:10000"
+# Optional. Leave unset for upstreams without auth.
+upstream_api_key: "change-me"
+
+# Optional default model for upstream requests.
+# If omitted and the client does not provide "model",
+# werkzeugkoppler requests GET /v1/models from upstream and uses the first model.
+#upstream_default_model: "gpt-oss-20b.heretic"
+
+# -----------------------------------------------------------------------------
+# Tool orchestration behavior
+# -----------------------------------------------------------------------------
+# All three fields below are optional.
+# If omitted, defaults are used:
+#   refresh_seconds: 300
+#   max_tool_concurrency: 4
+#   max_tool_loops: 8
+#
+# How often MCP tool lists are refreshed in background (seconds).
+#refresh_seconds: 300
+#
+# Max number of tool calls executed in parallel per assistant tool-call round.
+#max_tool_concurrency: 4
+#
+# Safety limit for iterative tool loop rounds (assistant -> tool -> assistant ...).
+#max_tool_loops: 8
+
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+# Optional.
+# If omitted, default logging config is used:
+#   level: INFO
+#   json: false
+logging:
+  # One of: DEBUG, INFO, WARNING, ERROR, CRITICAL
+  level: INFO
+
+  # If true: JSON log lines. If false: text logs.
+  json: false
+
+# -----------------------------------------------------------------------------
+# First messages (prepended before incoming chat messages)
+# -----------------------------------------------------------------------------
+# Optional system prompts injected before user/assistant history.
+# Token replacement supported in message content:
+#   {today}  or  {  today  }
+# replaced at runtime by current datetime in German format.
+first_messages:
+  - role: "system"
+    content: |
+      You are a precise assistant.
+      Keep answers concise and factual.
+      Current date/time: {today}
+
+# -----------------------------------------------------------------------------
+# MCP servers (optional)
+# -----------------------------------------------------------------------------
+# You can configure zero, one, or many MCP servers.
+# Supported transport values:
+#   - "http"  (JSON-RPC POST and/or streamable-http variant)
+#   - "stdio" (spawned local process)
+#
+# The gateway starts even if a server is down (degraded mode).
+# Health status is available via GET /healthz.
+mcp_servers:
+  # -----------------------------
+  # HTTP MCP example
+  # -----------------------------
+  - server_id: "demo_http_mcp"
+    transport: "http"
+
+    # Final URL preferred (include trailing slash if your server expects it)
+    url: "http://127.0.0.1:18080/mcp/"
+
+    # TCP connect timeout
+    connect_timeout_seconds: 5
+
+    # Read timeout for MCP responses
+    read_timeout_seconds: 30
+
+    # Per-tool-call timeout used by gateway tool dispatch
+    tool_call_timeout_seconds: 60
+
+  # -----------------------------
+  # STDIO MCP example
+  # -----------------------------
+  - server_id: "demo_stdio_mcp"
+    transport: "stdio"
+
+    # Command to start MCP server process
+    command: "python3"
+
+    # Command args
+    args:
+      - "path/to/mcp_stdio_server.py"
+      - "--some-flag"
+
+    connect_timeout_seconds: 5
+    read_timeout_seconds: 30
+    tool_call_timeout_seconds: 60
+
+# -----------------------------------------------------------------------------
+# Local actions (optional)
+# -----------------------------------------------------------------------------
+# Actions are exposed as additional tools with prefix: actions__<name>
+# and executed by werkzeugkoppler itself (no external MCP needed).
+#
+# Parameter types:
+#   - insecure_string      : plain user-provided string (no escaping guarantees)
+#   - project_file_path    : must resolve inside project root
+#   - required_env_var     : read from process env, must exist
+#   - optional_env_var     : read from process env if available
+actions:
+  - name: "query_notes"
+    description: "Search local notes by semantic query"
+
+    # Executable command
+    command: "/usr/local/bin/query_embeddings"
+
+    # Optional argument list. Parameter placeholders use $PARAM_NAME.
+    arguments:
+      - "search"
+      - "--index"
+      - "/path/to/index"
+      - "--results-only"
+      - "--query"
+      - "$QUERY"
+
+    # Optional input parameter schema for the model/tool call.
+    parameters:
+      - name: "QUERY"
+        type: "insecure_string"
+        description: "Use full question/topic for better retrieval precision"
+
+    # Optional working directory relative to project root.
+    #run_path: "subdir"
+
+    # Command timeout in seconds.
+    timeout: 60
+
+  - name: "memory_add"
+    description: "Persist a memory entry"
+    command: "/usr/local/bin/memories"
+    arguments:
+      - "add"
+      - "--text"
+      - "$TEXT"
+    parameters:
+      - name: "TEXT"
+        type: "insecure_string"
+        description: "Memory text"

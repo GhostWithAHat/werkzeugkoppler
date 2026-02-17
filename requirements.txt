@@ -1,0 +1,6 @@
+fastapi>=0.115
+uvicorn>=0.30
+httpx>=0.28
+pydantic>=2.7
+pydantic-settings>=2.2
+PyYAML>=6.0

@@ -1,0 +1,17 @@
+# Minimal config for getting started.
+# Copy this file to config.yaml and change values as needed.
+
+# URL where werkzeugkoppler itself listens.
+service_base_url: "http://127.0.0.1:10001"
+
+# Optional: protect this endpoint with a bearer token.
+#service_api_key: "change-me"
+
+# OpenAI-compatible upstream LLM endpoint.
+upstream_base_url: "http://127.0.0.1:10000"
+
+# Optional: set if your upstream requires auth.
+#upstream_api_key: "change-me"
+
+# Optional: if omitted, first upstream model from /v1/models is used.
+#upstream_default_model: "my-model"
