@@ -57,6 +57,10 @@ else:
 
 LOG = logging.getLogger(__name__)
 _TODAY_TOKEN_RE = re.compile(r"\{\s*today\s*\}")
+_TRACE_TOOL_CALL_PREFIX = "==> tool call"
+_TRACE_TOOL_RESULT_PREFIX = "==> tool result"
+_CONTENT_MIRROR_HEADER = "==> Preparation done. Preview of final assistant.content:"
+_CONTENT_MIRROR_MARKER = f"\n\n---\n\n\n{_CONTENT_MIRROR_HEADER}\n\n"
 
 
 def _extract_bearer_token(request: Request) -> str | None:
@@ -160,6 +164,65 @@ def _prepare_messages(messages: list[Any], first_messages: list[dict[str, Any]])
 def _sse_data(payload: dict[str, Any]) -> bytes:
     """Encode one SSE `data:` event."""
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
+
+
+def _sse_comment(text: str) -> bytes:
+    """Encode one SSE comment/heartbeat event."""
+    return f": {text}\n\n".encode("utf-8")
+
+
+async def _stream_with_keepalive(
+    source: AsyncGenerator[bytes, None],
+    *,
+    keepalive_seconds: float,
+    request: Request | None = None,
+) -> AsyncGenerator[bytes, None]:
+    """Forward stream chunks and emit periodic SSE heartbeats while waiting."""
+    try:
+        if keepalive_seconds <= 0:
+            async for item in source:
+                if request is not None and await request.is_disconnected():
+                    return
+                yield item
+            return
+
+        iterator = source.__aiter__()
+        while True:
+            next_item = asyncio.create_task(iterator.__anext__())
+            try:
+                while not next_item.done():
+                    if request is not None and await request.is_disconnected():
+                        next_item.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await next_item
+                        return
+                    done, _ = await asyncio.wait({next_item}, timeout=keepalive_seconds)
+                    if done:
+                        break
+                    if request is not None and await request.is_disconnected():
+                        next_item.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await next_item
+                        return
+                    yield _sse_comment("keepalive")
+                yield next_item.result()
+            except StopAsyncIteration:
+                return
+            except asyncio.CancelledError:
+                if not next_item.done():
+                    next_item.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await next_item
+                raise
+            except Exception:
+                if not next_item.done():
+                    next_item.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await next_item
+                raise
+    finally:
+        with contextlib.suppress(Exception):
+            await source.aclose()
 
 
 def _append_tool_call_delta(
@@ -284,15 +347,129 @@ def _compact_json(value: Any, max_len: int = 3000) -> str:
     return raw
 
 
-def _reasoning_chunk(*, completion_id: str, model: str, created: int, text: str) -> dict[str, Any]:
+def _reasoning_delta_payload(
+    *,
+    value: Any,
+    preferred_field: str | None = None,
+) -> dict[str, Any]:
+    """Build reasoning delta payload with fixed passthrough behavior."""
+    if preferred_field == "reasoning_content":
+        return {"reasoning_content": value}
+    return {"reasoning": value}
+
+
+def _reasoning_chunk(
+    *,
+    completion_id: str,
+    model: str,
+    created: int,
+    value: Any,
+    preferred_field: str | None = None,
+) -> dict[str, Any]:
     """Build a chunk that appends text to the reasoning channel."""
     return _client_chunk(
         completion_id=completion_id,
         model=model,
         created=created,
-        delta={"reasoning_content": text},
+        delta=_reasoning_delta_payload(
+            value=value,
+            preferred_field=preferred_field,
+        ),
         finish_reason=None,
     )
+
+
+def _passthrough_non_content_delta_chunk(
+    chunk: dict[str, Any],
+    *,
+    completion_id: str,
+    model: str,
+) -> dict[str, Any] | None:
+    """Rewrite and forward delta fields except content/tool_calls."""
+    out = _rewrite_chunk_identity(chunk, completion_id=completion_id, model=model)
+    choice = _pick_primary_choice(out)
+    if choice is None:
+        return None
+
+    delta = choice.get("delta")
+    if not isinstance(delta, dict):
+        return None
+
+    passthrough_delta = {k: v for k, v in delta.items() if k not in {"content", "tool_calls"}}
+    if not passthrough_delta:
+        return None
+
+    choice["delta"] = passthrough_delta
+    # Passthrough events are incremental metadata/thinking; final stop is emitted with answer content later.
+    choice["finish_reason"] = None
+    return out
+
+
+def _is_reasoning_content_item(item: Any) -> bool:
+    """Best-effort detection for reasoning-style content blocks."""
+    if not isinstance(item, dict):
+        return False
+    item_type = str(item.get("type") or "").strip().lower()
+    if "reason" in item_type:
+        return True
+    if item_type in {"summary", "summary_text", "thinking"}:
+        return True
+    return any(key in item for key in ("reasoning", "reasoning_content", "summary"))
+
+
+def _split_content_for_stream(content_value: Any) -> tuple[Any | None, Any | None]:
+    """Split delta.content into immediate reasoning part and buffered final part."""
+    if content_value is None:
+        return None, None
+    if isinstance(content_value, str):
+        return None, content_value
+    if isinstance(content_value, list):
+        reasoning_items = [item for item in content_value if _is_reasoning_content_item(item)]
+        final_items = [item for item in content_value if not _is_reasoning_content_item(item)]
+        return (reasoning_items or None), (final_items or None)
+    if _is_reasoning_content_item(content_value):
+        return content_value, None
+    return None, content_value
+
+
+def _chunk_with_content_delta(
+    chunk: dict[str, Any],
+    *,
+    completion_id: str,
+    model: str,
+    content_value: Any,
+    finish_reason: str | None,
+) -> dict[str, Any] | None:
+    """Rewrite one chunk identity and replace delta with selected content payload."""
+    out = _rewrite_chunk_identity(chunk, completion_id=completion_id, model=model)
+    choice = _pick_primary_choice(out)
+    if choice is None:
+        return None
+    delta = choice.get("delta")
+    if not isinstance(delta, dict):
+        return None
+    new_delta = {"content": content_value}
+    if isinstance(delta.get("role"), str):
+        new_delta["role"] = delta["role"]
+    choice["delta"] = new_delta
+    choice["finish_reason"] = finish_reason
+    return out
+
+
+def _content_to_thinking_value(content_value: Any) -> str | None:
+    """Extract a readable thinking text from content payload shapes."""
+    if isinstance(content_value, str):
+        return content_value if content_value else None
+    if isinstance(content_value, list):
+        parts: list[str] = []
+        for item in content_value:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str) and text:
+                    parts.append(text)
+        if parts:
+            return "".join(parts)
+    return None
 
 
 def _tool_trace_line(status: dict[str, Any]) -> str | None:
@@ -300,13 +477,13 @@ def _tool_trace_line(status: dict[str, Any]) -> str | None:
     event_type = status.get("type")
     if event_type == "tool_start":
         payload = {"name": status.get("tool"), "arguments": status.get("arguments")}
-        return f"\n\n==> tool call `{_compact_json(payload)}`\n"
+        return f"\n\n{_TRACE_TOOL_CALL_PREFIX} `{_compact_json(payload)}`\n"
     if event_type == "tool_end":
         if status.get("ok"):
             payload: Any = status.get("result")
         else:
             payload = {"error": status.get("error"), "is_error": True}
-        return f"==> tool result `{_compact_json(payload)}`\n\n"
+        return f"{_TRACE_TOOL_RESULT_PREFIX} `{_compact_json(payload)}`\n\n"
     return None
 
 
@@ -601,7 +778,7 @@ async def _stream_tool_execution_trace(
                     completion_id=completion_id,
                     model=model,
                     created=created,
-                    text=line,
+                    value=line,
                 )
             )
 
@@ -614,7 +791,7 @@ async def _stream_tool_execution_trace(
                     completion_id=completion_id,
                     model=model,
                     created=created,
-                    text=line,
+                    value=line,
                 )
             )
 
@@ -627,11 +804,10 @@ async def _stream_chat(
 ) -> AsyncGenerator[bytes, None]:
     """Run streaming chat orchestration with tool loops.
 
-    The client receives:
-    - one assistant role start chunk,
-    - reasoning deltas (including tool call/result trace),
-    - one final assistant answer stream,
-    - DONE marker.
+    Stream behavior is controlled via `stream_answer_mode`:
+    - `live`: forward assistant content deltas immediately.
+    - `safe_preview`: buffer assistant content until the round is complete and
+      mirror interim content into reasoning for user-visible progress.
     """
     base_payload, messages, user_tools = _build_base_payload(request_payload, service.cfg.upstream_default_model)
     if not base_payload.get("model"):
@@ -656,8 +832,19 @@ async def _stream_chat(
             finish_reason=None,
         )
     )
+    # Start the reasoning panel early without emitting answer content.
+    yield _sse_data(
+        _reasoning_chunk(
+            completion_id=completion_id,
+            model=model,
+            created=created,
+            value="\n",
+        )
+    )
 
     for _ in range(max(1, service.cfg.max_tool_loops)):
+        answer_mode = service.cfg.stream_answer_mode or "live"
+        safe_preview_mode = answer_mode == "safe_preview"
         upstream_payload = {
             **base_payload,
             "messages": messages,
@@ -670,6 +857,8 @@ async def _stream_chat(
         finish_reason: str | None = None
         got_chunks = False
         buffered_content_chunks: list[dict[str, Any]] = []
+        content_mirror_marker_sent = False
+        content_emitted_live = False
 
         async for chunk in service.upstream.stream_chat_completion(upstream_payload):
             got_chunks = True
@@ -678,20 +867,63 @@ async def _stream_chat(
             finish_reason = choice0.get("finish_reason") or finish_reason
             delta = choice0.get("delta") or {}
 
-            reasoning_text = delta.get("reasoning_content") or delta.get("reasoning")
-            if isinstance(reasoning_text, str) and reasoning_text.strip():
-                yield _sse_data(
-                    _reasoning_chunk(
-                        completion_id=completion_id,
-                        model=model,
-                        created=created,
-                        text=reasoning_text,
-                    )
-                )
+            passthrough_chunk = _passthrough_non_content_delta_chunk(
+                single_chunk,
+                completion_id=completion_id,
+                model=model,
+            )
+            if passthrough_chunk is not None:
+                yield _sse_data(passthrough_chunk)
 
-            if isinstance(delta.get("content"), str):
-                assistant_content_parts.append(delta["content"])
-                buffered_content_chunks.append(single_chunk)
+            reasoning_content, final_content = _split_content_for_stream(delta.get("content"))
+            if reasoning_content is not None:
+                reasoning_chunk = _chunk_with_content_delta(
+                    single_chunk,
+                    completion_id=completion_id,
+                    model=model,
+                    content_value=reasoning_content,
+                    finish_reason=None,
+                )
+                if reasoning_chunk is not None:
+                    yield _sse_data(reasoning_chunk)
+
+            if final_content is not None:
+                if safe_preview_mode:
+                    mirrored_thinking = _content_to_thinking_value(final_content)
+                    if mirrored_thinking:
+                        if not content_mirror_marker_sent:
+                            yield _sse_data(
+                                _reasoning_chunk(
+                                    completion_id=completion_id,
+                                    model=model,
+                                    created=created,
+                                    value=_CONTENT_MIRROR_MARKER,
+                                )
+                            )
+                            content_mirror_marker_sent = True
+                        yield _sse_data(
+                            _reasoning_chunk(
+                                completion_id=completion_id,
+                                model=model,
+                                created=created,
+                                value=mirrored_thinking,
+                            )
+                        )
+                if isinstance(final_content, str):
+                    assistant_content_parts.append(final_content)
+                final_content_chunk = _chunk_with_content_delta(
+                    single_chunk,
+                    completion_id=completion_id,
+                    model=model,
+                    content_value=final_content,
+                    finish_reason=finish_reason,
+                )
+                if final_content_chunk is not None:
+                    if safe_preview_mode:
+                        buffered_content_chunks.append(final_content_chunk)
+                    else:
+                        content_emitted_live = True
+                        yield _sse_data(final_content_chunk)
 
             delta_tool_calls = delta.get("tool_calls")
             if isinstance(delta_tool_calls, list):
@@ -751,15 +983,18 @@ async def _stream_chat(
                 yield trace_chunk
             continue
 
-        # Final round: only forward assistant content chunks.
+        # Final round: only forward buffered assistant content chunks in safe_preview mode.
         emitted_answer = False
-        for chunk in buffered_content_chunks:
-            out = _rewrite_chunk_identity(chunk, completion_id=completion_id, model=model)
-            choice = _pick_primary_choice(out) or {}
-            delta = choice.get("delta") or {}
-            if isinstance(delta.get("content"), str):
-                emitted_answer = True
-                yield _sse_data(out)
+        if safe_preview_mode:
+            for chunk in buffered_content_chunks:
+                out = _rewrite_chunk_identity(chunk, completion_id=completion_id, model=model)
+                choice = _pick_primary_choice(out) or {}
+                delta = choice.get("delta") or {}
+                if "content" in delta:
+                    emitted_answer = True
+                    yield _sse_data(out)
+        else:
+            emitted_answer = content_emitted_live
 
         if not emitted_answer:
             content = "".join(assistant_content_parts).strip()
@@ -876,7 +1111,21 @@ def create_app(config_path: str | None = None) -> FastAPI:
         stream = bool(payload.get("stream"))
         try:
             if stream:
-                return StreamingResponse(service.stream_chat(payload), media_type="text/event-stream")
+                base_stream = service.stream_chat(payload)
+                keepalive_stream = _stream_with_keepalive(
+                    base_stream,
+                    keepalive_seconds=service.cfg.stream_keepalive_seconds or 0.0,
+                    request=request,
+                )
+                return StreamingResponse(
+                    keepalive_stream,
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "X-Accel-Buffering": "no",
+                    },
+                )
 
             async with service._op_lock:
                 resolved = await service.resolve_chat_non_stream(payload, status_queue=None)

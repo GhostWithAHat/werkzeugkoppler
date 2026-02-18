@@ -80,4 +80,3 @@ The client should use the standard OpenAI routes:
 
 - `GET /v1/models`
 - `POST /v1/chat/completions`
-

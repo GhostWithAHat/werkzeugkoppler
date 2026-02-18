@@ -50,6 +50,16 @@ upstream_api_key: "change-me"
 #
 # Safety limit for iterative tool loop rounds (assistant -> tool -> assistant ...).
 #max_tool_loops: 8
+#
+# Streaming keepalive interval in seconds. While waiting for upstream/tool output,
+# werkzeugkoppler sends SSE heartbeat comments so clients/proxies do not appear stuck.
+#stream_keepalive_seconds: 1.0
+#
+# Answer stream mode:
+#   live         -> stream assistant.content immediately (default)
+#   safe_preview -> buffer assistant.content until the round is complete and
+#                   mirror progress into thinking output
+#stream_answer_mode: "live"
 
 # -----------------------------------------------------------------------------
 # Logging

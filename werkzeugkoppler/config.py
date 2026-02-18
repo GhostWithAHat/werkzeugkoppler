@@ -80,6 +80,8 @@ class GatewayConfig(BaseModel):
     refresh_seconds: int | None = None
     max_tool_concurrency: int | None = None
     max_tool_loops: int | None = None
+    stream_keepalive_seconds: float | None = None
+    stream_answer_mode: Literal["live", "safe_preview"] | None = None
 
     mcp_servers: list[MCPServerConfig] = Field(default_factory=list)
     actions: list[ActionConfig] = Field(default_factory=list)
@@ -99,6 +101,10 @@ class GatewayConfig(BaseModel):
             self.max_tool_concurrency = 4
         if self.max_tool_loops is None:
             self.max_tool_loops = 8
+        if self.stream_keepalive_seconds is None:
+            self.stream_keepalive_seconds = 1.0
+        if self.stream_answer_mode is None:
+            self.stream_answer_mode = "live"
         if self.logging is None:
             self.logging = LoggingConfig()
         return self
@@ -140,6 +146,8 @@ def _override_from_env(data: dict[str, Any]) -> dict[str, Any]:
         "refresh_seconds": "WERKZEUGKOPPLER_REFRESH_SECONDS",
         "max_tool_concurrency": "WERKZEUGKOPPLER_MAX_TOOL_CONCURRENCY",
         "max_tool_loops": "WERKZEUGKOPPLER_MAX_TOOL_LOOPS",
+        "stream_keepalive_seconds": "WERKZEUGKOPPLER_STREAM_KEEPALIVE_SECONDS",
+        "stream_answer_mode": "WERKZEUGKOPPLER_STREAM_ANSWER_MODE",
         "logging.level": "WERKZEUGKOPPLER_LOG_LEVEL",
         "logging.json_logs": "WERKZEUGKOPPLER_LOG_JSON",
     }
@@ -154,6 +162,10 @@ def _override_from_env(data: dict[str, Any]) -> dict[str, Any]:
 
         if key in {"refresh_seconds", "max_tool_concurrency", "max_tool_loops"}:
             out[key] = int(value)
+        elif key == "stream_keepalive_seconds":
+            out[key] = float(value)
+        elif key == "stream_answer_mode":
+            out[key] = value.strip().lower()
         elif key == "logging.json_logs":
             out["logging"]["json"] = value.lower() in {"1", "true", "yes", "on"}
         elif key == "logging.level":
