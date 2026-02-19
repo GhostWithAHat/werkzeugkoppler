@@ -65,6 +65,16 @@ class ActionConfig(BaseModel):
     timeout: int = 60
 
 
+class LastUserMessageReaderConfig(BaseModel):
+    """Executable command definition for last-user-message-based substitution."""
+
+    name: str
+    command: str
+    arguments: list[str] | None = None
+    run_path: str | None = None
+    timeout: int = 60
+
+
 class GatewayConfig(BaseModel):
     """Top-level gateway configuration."""
 
@@ -76,8 +86,11 @@ class GatewayConfig(BaseModel):
     upstream_base_url: str
     upstream_api_key: str | None = None
     upstream_default_model: str | None = None
+    fallback_fake_model_name: str | None = None
+    upstream_connect_retries: int | None = None
+    upstream_retry_interval_ms: int | None = None
 
-    refresh_seconds: int | None = None
+    mcp_servers_refresh_seconds: int | None = None
     max_tool_concurrency: int | None = None
     max_tool_loops: int | None = None
     stream_keepalive_seconds: float | None = None
@@ -85,8 +98,33 @@ class GatewayConfig(BaseModel):
 
     mcp_servers: list[MCPServerConfig] = Field(default_factory=list)
     actions: list[ActionConfig] = Field(default_factory=list)
-    first_messages: list[dict[str, Any]] = Field(default_factory=list)
+    allowed_direct_commands: list[str] = Field(default_factory=list)
+    allowed_direct_commands_max_output_lines: int | None = None
+    allowed_direct_commands_max_output_bytes: int | None = None
+    last_user_message_readers: list[LastUserMessageReaderConfig] = Field(default_factory=list)
+    init_messages: list[dict[str, Any]] = Field(default_factory=list)
     logging: LoggingConfig | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_direct_command_output_limit_aliases(cls, data: Any) -> Any:
+        """Support short aliases for direct command output limits."""
+        if not isinstance(data, dict):
+            return data
+        mapped = dict(data)
+        alias_map = {
+            "max_output_lines": "allowed_direct_commands_max_output_lines",
+            "max_output_bytes": "allowed_direct_commands_max_output_bytes",
+        }
+        for alias, canonical in alias_map.items():
+            if alias in mapped and canonical in mapped:
+                if mapped[alias] != mapped[canonical]:
+                    raise ValueError(f"Both '{alias}' and '{canonical}' are set with different values")
+                mapped.pop(alias, None)
+                continue
+            if alias in mapped:
+                mapped[canonical] = mapped.pop(alias)
+        return mapped
 
     @model_validator(mode="after")
     def _validate_service_base_url(self) -> "GatewayConfig":
@@ -95,8 +133,12 @@ class GatewayConfig(BaseModel):
         if not parsed.hostname or parsed.port is None:
             raise ValueError("service_base_url must include host and port, e.g. http://127.0.0.1:8080")
         # Fallback defaults (matching current config.yaml values).
-        if self.refresh_seconds is None:
-            self.refresh_seconds = 300
+        if self.mcp_servers_refresh_seconds is None:
+            self.mcp_servers_refresh_seconds = 300
+        if self.upstream_connect_retries is None:
+            self.upstream_connect_retries = 0
+        if self.upstream_retry_interval_ms is None:
+            self.upstream_retry_interval_ms = 1000
         if self.max_tool_concurrency is None:
             self.max_tool_concurrency = 4
         if self.max_tool_loops is None:
@@ -107,9 +149,33 @@ class GatewayConfig(BaseModel):
             self.stream_answer_mode = "live"
         if self.logging is None:
             self.logging = LoggingConfig()
+        if self.allowed_direct_commands_max_output_lines is None:
+            self.allowed_direct_commands_max_output_lines = 800
+        if self.allowed_direct_commands_max_output_bytes is None:
+            self.allowed_direct_commands_max_output_bytes = 80000
         return self
 
-    @field_validator("mcp_servers", "actions", "first_messages", mode="before")
+    @field_validator(
+        "allowed_direct_commands_max_output_lines",
+        "allowed_direct_commands_max_output_bytes",
+    )
+    @classmethod
+    def _validate_positive_output_limits(cls, value: int | None) -> int | None:
+        """Ensure direct command output limits are non-negative (0 disables a limit)."""
+        if value is None:
+            return None
+        if value < 0:
+            raise ValueError("direct command output limits must be >= 0")
+        return value
+
+    @field_validator(
+        "mcp_servers",
+        "actions",
+        "allowed_direct_commands",
+        "last_user_message_readers",
+        "init_messages",
+        mode="before",
+    )
     @classmethod
     def _none_to_empty_list(cls, value: Any) -> Any:
         """Treat explicit YAML `null` for list fields as an empty list."""
@@ -143,7 +209,9 @@ def _override_from_env(data: dict[str, Any]) -> dict[str, Any]:
         "upstream_base_url": "WERKZEUGKOPPLER_UPSTREAM_BASE_URL",
         "upstream_api_key": "WERKZEUGKOPPLER_UPSTREAM_API_KEY",
         "upstream_default_model": "WERKZEUGKOPPLER_UPSTREAM_DEFAULT_MODEL",
-        "refresh_seconds": "WERKZEUGKOPPLER_REFRESH_SECONDS",
+        "mcp_servers_refresh_seconds": "WERKZEUGKOPPLER_MCP_SERVERS_REFRESH_SECONDS",
+        "upstream_connect_retries": "WERKZEUGKOPPLER_UPSTREAM_CONNECT_RETRIES",
+        "upstream_retry_interval_ms": "WERKZEUGKOPPLER_UPSTREAM_RETRY_INTERVAL_MS",
         "max_tool_concurrency": "WERKZEUGKOPPLER_MAX_TOOL_CONCURRENCY",
         "max_tool_loops": "WERKZEUGKOPPLER_MAX_TOOL_LOOPS",
         "stream_keepalive_seconds": "WERKZEUGKOPPLER_STREAM_KEEPALIVE_SECONDS",
@@ -160,7 +228,13 @@ def _override_from_env(data: dict[str, Any]) -> dict[str, Any]:
         if value is None:
             continue
 
-        if key in {"refresh_seconds", "max_tool_concurrency", "max_tool_loops"}:
+        if key in {
+            "mcp_servers_refresh_seconds",
+            "upstream_connect_retries",
+            "upstream_retry_interval_ms",
+            "max_tool_concurrency",
+            "max_tool_loops",
+        }:
             out[key] = int(value)
         elif key == "stream_keepalive_seconds":
             out[key] = float(value)

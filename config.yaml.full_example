@@ -33,17 +33,24 @@ upstream_api_key: "change-me"
 # werkzeugkoppler requests GET /v1/models from upstream and uses the first model.
 #upstream_default_model: "gpt-oss-20b.heretic"
 
+# Optional fake model name used only when upstream is unreachable and no
+# previously active model is known yet.
+#fallback_fake_model_name: "werkzeugkoppler"
+#
+# Retry behavior when upstream model endpoint is temporarily unreachable.
+# `upstream_connect_retries` is the number of retries after the first failed
+# request. Default is 0 (= fail immediately after first error).
+# Negative values mean retry forever (until client disconnects).
+#upstream_connect_retries: 0
+#upstream_retry_interval_ms: 1000
+
 # -----------------------------------------------------------------------------
 # Tool orchestration behavior
 # -----------------------------------------------------------------------------
-# All three fields below are optional.
+# All fields below are optional.
 # If omitted, defaults are used:
-#   refresh_seconds: 300
 #   max_tool_concurrency: 4
 #   max_tool_loops: 8
-#
-# How often MCP tool lists are refreshed in background (seconds).
-#refresh_seconds: 300
 #
 # Max number of tool calls executed in parallel per assistant tool-call round.
 #max_tool_concurrency: 4
@@ -62,6 +69,34 @@ upstream_api_key: "change-me"
 #stream_answer_mode: "live"
 
 # -----------------------------------------------------------------------------
+# Direct shell commands from chat (optional)
+# -----------------------------------------------------------------------------
+# If the latest user message starts with "@@", werkzeugkoppler can execute it
+# directly (without calling the model), as long as the first command token is
+# listed here.
+# Wildcards with "*" are supported (glob on the first command token), e.g.
+# "apt-*", "/usr/local/bin/*", or "*".
+#
+# Example user message:
+#   @@ change_model gpt-4o
+#
+# In all model-bound requests, user messages starting with "@@" and the next
+# assistant message are removed from forwarded history.
+#allowed_direct_commands:
+#  - "change_model"
+#  - "apt-*"
+#  - "/usr/local/bin/*"
+#
+# Safety limits for output of allowed direct commands.
+# Command execution is aborted as soon as one limit is exceeded.
+# Set a limit to 0 to disable that specific limit.
+# Defaults:
+#   allowed_direct_commands_max_output_lines: 8000
+#   allowed_direct_commands_max_output_bytes: 40000
+#allowed_direct_commands_max_output_lines: 8000
+#allowed_direct_commands_max_output_bytes: 40000
+
+# -----------------------------------------------------------------------------
 # Logging
 # -----------------------------------------------------------------------------
 # Optional.
@@ -76,18 +111,51 @@ logging:
   json: false
 
 # -----------------------------------------------------------------------------
-# First messages (prepended before incoming chat messages)
+# Last user message readers
+# -----------------------------------------------------------------------------
+# Last user message readers are NOT exposed as tools. They are called on every
+# client request. 
+# 
+# You can pass `$LAST_USER_MESSAGE` in `command` an `arguments`. It will be
+# replaced by the latest user message.  The result (stdout) can later be used
+# as a substitution in the init_messages.
+#
+# It is meant to be used to implement RAG: You pass the last user message to a
+# search programm. The search programm provides background information that
+# has a semantic relation to the last user message. This background information 
+# is then put in the init_message, to provide the model with helpfull data.
+last_user_message_readers:
+  - name: "bio"
+    command: "/usr/local/bin/query_embeddings"
+    arguments:
+      - "search"
+      - "--index"
+      - "/path/to/index"
+      - "--results-only"
+      - "--query"
+      - "$LAST_USER_MESSAGE"
+
+# -----------------------------------------------------------------------------
+# Init messages (prepended before incoming chat messages)
 # -----------------------------------------------------------------------------
 # Optional system prompts injected before user/assistant history.
-# Token replacement supported in message content:
-#   {today}  or  {  today  }
-# replaced at runtime by current datetime in German format.
-first_messages:
+#
+# A the time the user sends a request,
+#   "{ today }" 
+# (without quotes) will be replaced with the current datetime in # German
+# format, and
+#   "{ last_user_message_reader_result:xxx }" 
+# (without quotes) will be replaced by stdout (trimmed) from the last
+# user message reader named `xxx`.
+init_messages:
   - role: "system"
     content: |
       You are a precise assistant.
       Keep answers concise and factual.
       Current date/time: {today}
+      Background information: 
+      { last_user_message_reader_result:bio }
+
 
 # -----------------------------------------------------------------------------
 # MCP servers (optional)
@@ -99,6 +167,8 @@ first_messages:
 #
 # The gateway starts even if a server is down (degraded mode).
 # Health status is available via GET /healthz.
+# How often MCP tool lists are refreshed in background (seconds).
+#mcp_servers_refresh_seconds: 300
 mcp_servers:
   # -----------------------------
   # HTTP MCP example

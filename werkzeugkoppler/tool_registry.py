@@ -19,7 +19,7 @@ from typing import Any
 from .config import ActionConfig, GatewayConfig, MCPServerConfig
 from .local_actions import LocalActionError, LocalActionExecutor
 from .mcp_client import HTTPMCPClient, MCPClient, MCPError, StdioMCPClient, ToolBinding
-from .utils import to_bounded_json
+from .json_helpers import to_bounded_json
 
 LOG = logging.getLogger(__name__)
 
@@ -95,7 +95,7 @@ class ToolRegistry:
         """Refresh tools periodically or on explicit notifications."""
         while True:
             try:
-                await asyncio.wait_for(self._refresh_event.wait(), timeout=self.cfg.refresh_seconds)
+                await asyncio.wait_for(self._refresh_event.wait(), timeout=self.cfg.mcp_servers_refresh_seconds)
                 self._refresh_event.clear()
             except asyncio.TimeoutError:
                 pass

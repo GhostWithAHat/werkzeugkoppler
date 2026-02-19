@@ -13,5 +13,8 @@ upstream_base_url: "http://127.0.0.1:10000"
 # Optional: set if your upstream requires auth.
 #upstream_api_key: "change-me"
 
-# Optional: if omitted, first upstream model from /v1/models is used.
-#upstream_default_model: "my-model"
+# Optional safety limits for @@ allowed_direct_commands output.
+# Execution is aborted as soon as one limit is exceeded.
+# Set a limit to 0 to disable that specific limit.
+#allowed_direct_commands_max_output_lines: 8000
+#allowed_direct_commands_max_output_bytes: 40000
